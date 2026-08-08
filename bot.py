@@ -213,7 +213,7 @@ class Config:
             docker_memory=os.getenv("DOCKER_MEMORY", "256m").strip() or "256m",
             docker_pids=max(16, _env_int("DOCKER_PIDS", 128)),
             docker_tmp_size=os.getenv("DOCKER_TMP_SIZE", "64m").strip() or "64m",
-            stdin_timeout_seconds=_env_int("STDIN_TIMEOUT_SECONDS", 120),
+            stdin_timeout_seconds=_env_int("STDIN_TIMEOUT_SECONDS", 3600),
             input_wait_detect_seconds=max(3, _env_int("INPUT_WAIT_DETECT_SECONDS", 8)),
             terminal_timeout=_env_int("TERMINAL_TIMEOUT", 15),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -956,11 +956,14 @@ class SubprocessBackend:
         return True, ""
 
     def _clean_env(self, runtime: str) -> dict:
-        return {
+        env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": tempfile.gettempdir(),
             "LANG": "C.UTF-8",
         }
+        if runtime == "python":
+            env["PYTHONUNBUFFERED"] = "1"
+        return env
 
     def _venv(self, project_id: str) -> Path:
         return self.cfg.base_dir / "venvs" / project_id
@@ -1052,7 +1055,7 @@ class _SubprocessInstallHandle(InstallHandle):
     def stream(self):
         assert self.proc.stdout is not None
         while True:
-            chunk = self.proc.stdout.read(4096)
+            chunk = self.proc.stdout.readline()
             if not chunk:
                 break
             yield chunk
@@ -1088,7 +1091,7 @@ class _SubprocessRunHandle(RunHandle):
     def stream(self):
         assert self.proc.stdout is not None
         while True:
-            chunk = self.proc.stdout.read(4096)
+            chunk = self.proc.stdout.readline()
             if not chunk:
                 break
             yield chunk
