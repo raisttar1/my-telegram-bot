@@ -200,7 +200,7 @@ class Config:
             max_projects_per_user=_env_int("MAX_PROJECTS_PER_USER", 10),
             max_processes_per_user=_env_int("MAX_PROCESSES_PER_USER", 2),
             max_global_processes=_env_int("MAX_GLOBAL_PROCESSES", 10),
-            execution_timeout=_env_int("EXECUTION_TIMEOUT", 120),
+            execution_timeout=_env_int("EXECUTION_TIMEOUT", 3600),
             max_stored_processes_per_user=_env_int("MAX_STORED_PROCESSES_PER_USER", 25),
             max_log_bytes=_env_int("MAX_LOG_BYTES", 262144),
             live_update_seconds=max(1, _env_int("LIVE_UPDATE_SECONDS", 3)),
