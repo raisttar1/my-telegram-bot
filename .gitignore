@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Runtime state (never commit)
+data/
+bot_data.json
+venvs/
+logs/
+*.tmp
+*.corrupt.json

@@ -1,0 +1,20 @@
+[Unit]
+Description=Telegram Script-Hosting Bot
+After=network.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/telegram-bot
+EnvironmentFile=/home/ubuntu/telegram-bot/.env
+ExecStart=/home/ubuntu/telegram-bot/.venv/bin/python /home/ubuntu/telegram-bot/bot.py
+Restart=always
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

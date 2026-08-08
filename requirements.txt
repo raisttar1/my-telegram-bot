@@ -1,0 +1,5 @@
+python-telegram-bot>=20.0,<22
+python-dotenv>=1.0
+flask>=3.0
+waitress>=3.0
+docker>=6.1
