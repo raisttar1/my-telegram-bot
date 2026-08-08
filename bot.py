@@ -79,6 +79,7 @@ from telegram import (
     error as tg_error,
 )
 from telegram.constants import ParseMode
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -167,6 +168,13 @@ class Config:
     terminal_timeout: int
     log_level: str
 
+    http_connect_timeout: float
+    http_read_timeout: float
+    http_write_timeout: float
+    http_pool_timeout: float
+    http_pool_size: int
+    watchdog_retry_seconds: float
+
     @classmethod
     def from_env(cls) -> "Config":
         token = os.getenv("BOT_TOKEN", "").strip()
@@ -217,6 +225,12 @@ class Config:
             input_wait_detect_seconds=max(3, _env_int("INPUT_WAIT_DETECT_SECONDS", 8)),
             terminal_timeout=_env_int("TERMINAL_TIMEOUT", 15),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            http_connect_timeout=_env_float("HTTP_CONNECT_TIMEOUT", 30),
+            http_read_timeout=_env_float("HTTP_READ_TIMEOUT", 30),
+            http_write_timeout=_env_float("HTTP_WRITE_TIMEOUT", 30),
+            http_pool_timeout=_env_float("HTTP_POOL_TIMEOUT", 10),
+            http_pool_size=max(1, _env_int("HTTP_POOL_SIZE", 10)),
+            watchdog_retry_seconds=max(1.0, _env_float("WATCHDOG_RETRY_SECONDS", 5)),
         )
 
     @property
@@ -2552,6 +2566,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _prepare_zip_project(tmp: Path, project_dir: Path, cfg: Config) -> tuple[str, str, list[str]]:
+    count = safe_extract_zip(tmp, project_dir, cfg)
+    tmp.unlink(missing_ok=True)
+    entrypoint, runtime = detect_entrypoint(project_dir)
+    return entrypoint, runtime, scan_project_files(project_dir)
+
+
 # ---- file upload handler ---------------------------------------------------
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -2611,13 +2632,14 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 raise ValueError(
                     f"Archive too large: {human_size(tmp.stat().st_size)} (max {cfg.max_archive_mb} MB)."
                 )
-            count = safe_extract_zip(tmp, project_dir, cfg)
-            tmp.unlink(missing_ok=True)
-            log.info("Extracted %s files for project %s (user %s)", count, project_id, user.id)
+            entrypoint, runtime, files = await asyncio.to_thread(
+                _prepare_zip_project, tmp, project_dir, cfg
+            )
+            log.info("Extracted %s files for project %s (user %s)", len(files), project_id, user.id)
         else:
             shutil.move(str(tmp), str(dest))
-
-        entrypoint, runtime = detect_entrypoint(project_dir)
+            entrypoint, runtime = detect_entrypoint(project_dir)
+            files = scan_project_files(project_dir)
     except Exception as exc:  # noqa: BLE001
         log.warning("Upload rejected for user %s: %s", user.id, exc)
         shutil.rmtree(project_dir, ignore_errors=True)
@@ -2632,7 +2654,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "entrypoint": entrypoint,
         "runtime": runtime,
         "uploaded_at": time.time(),
-        "files": scan_project_files(project_dir),
+        "files": files,
         "has_requirements": has_req,
         "has_package_json": has_pkg,
     }
@@ -2800,9 +2822,17 @@ def start_health_server(cfg: Config, manager: Optional[ProcessManager] = None) -
 # 12. Main
 # ---------------------------------------------------------------------------
 def _build_app(cfg: Config, store: DataStore, manager: ProcessManager) -> Application:
+    request = HTTPXRequest(
+        connect_timeout=cfg.http_connect_timeout,
+        read_timeout=cfg.http_read_timeout,
+        write_timeout=cfg.http_write_timeout,
+        pool_timeout=cfg.http_pool_timeout,
+        connection_pool_size=cfg.http_pool_size,
+    )
     app = (
         ApplicationBuilder()
         .token(cfg.bot_token)
+        .request(request)
         .post_init(lambda application: manager.reconcile())
         .build()
     )
@@ -2841,6 +2871,41 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
             log.exception("Failed to report error to user")
 
 
+async def _run_once(
+    cfg: Config, store: DataStore, manager: ProcessManager
+) -> None:
+    app = _build_app(cfg, store, manager)
+
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _signal_handler() -> None:
+        log.info("Signal received; shutting down")
+        stop_event.set()
+        asyncio.create_task(app.stop())
+
+    with contextlib.suppress(NotImplementedError):
+        loop.add_signal_handler(signal.SIGTERM, _signal_handler)
+        loop.add_signal_handler(signal.SIGINT, _signal_handler)
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(
+        allowed_updates=["message", "callback_query"], drop_pending_updates=True
+    )
+    try:
+        await stop_event.wait()
+    finally:
+        log.info("Cleaning up app")
+        with contextlib.suppress(Exception):
+            await app.updater.stop()
+        with contextlib.suppress(Exception):
+            await app.stop()
+        with contextlib.suppress(Exception):
+            await app.shutdown()
+        log.info("App stopped")
+
+
 async def run() -> None:
     cfg = Config.from_env()
     setup_logging(cfg.log_level)
@@ -2861,36 +2926,29 @@ async def run() -> None:
 
     start_health_server(cfg, manager)
 
-    app = _build_app(cfg, store, manager)
+    retry_delay = cfg.watchdog_retry_seconds
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            await _run_once(cfg, store, manager)
+            log.info("Bot exiting after graceful shutdown")
+            break
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "Bot crashed (attempt %s); reconnecting in %ss",
+                attempt,
+                retry_delay,
+            )
+            await asyncio.sleep(retry_delay)
 
-    loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
-
-    def _signal_handler() -> None:
-        log.info("Signal received; shutting down")
-        stop_event.set()
-        asyncio.create_task(app.stop())
-
-    with contextlib.suppress(NotImplementedError):
-        loop.add_signal_handler(signal.SIGTERM, _signal_handler)
-        loop.add_signal_handler(signal.SIGINT, _signal_handler)
-
-    try:
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(
-            allowed_updates=["message", "callback_query"], drop_pending_updates=True
-        )
-        await stop_event.wait()
-    except Exception:  # noqa: BLE001
-        log.exception("Bot crashed")
-    finally:
-        log.info("Cleaning up")
-        await manager.shutdown()
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-        log.info("Bye")
+    log.info("Cleaning up")
+    await manager.shutdown()
+    log.info("Bye")
 
 
 def main() -> None:
