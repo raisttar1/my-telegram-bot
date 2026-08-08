@@ -93,6 +93,8 @@ from telegram.ext import (
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+os.environ.setdefault("TERM", "dumb")
+
 APP_NAME = "telegram-script-bot"
 CONFIG_VERSION = 1
 ALLOWED_EXTENSIONS = {".py", ".js", ".zip"}
@@ -180,7 +182,10 @@ class Config:
         token = os.getenv("BOT_TOKEN", "").strip()
         owner_id = _env_int("OWNER_ID", 0)
         if not token:
-            raise ValueError("BOT_TOKEN is required (set it in .env)")
+            raise ValueError(
+                "BOT_TOKEN is required. Set it in your .env file or as a "
+                "BOT_TOKEN environment variable (do not rely on interactive input)."
+            )
         if owner_id <= 0:
             raise ValueError("OWNER_ID is required and must be a positive integer")
 
