@@ -32,10 +32,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import gc
 import html
 import json
 import logging
+import math
 import os
 import re
 import resource
@@ -103,6 +105,7 @@ os.environ.setdefault("TERM", "dumb")
 APP_NAME = "telegram-script-bot"
 CONFIG_VERSION = 1
 ALLOWED_EXTENSIONS = {".py", ".js", ".zip"}
+LIST_PAGE_SIZE = 5
 ZIP_ENTRY_LIMIT_MSG = "Archive contains too many files."
 
 log = logging.getLogger(APP_NAME)
@@ -158,6 +161,59 @@ async def _memory_monitor_loop(interval_seconds: int = 300) -> None:
     while True:
         await asyncio.sleep(interval_seconds)
         await asyncio.to_thread(log_memory_usage)
+
+
+# ---------------------------------------------------------------------------
+# Command rate limiting
+# ---------------------------------------------------------------------------
+USER_LAST_CALL: dict[int, float] = {}
+
+
+def rate_limit(seconds: float = 3.0):
+    """Throttle a command/callback handler per Telegram user id."""
+
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            user = update.effective_user
+            if user is None:
+                return await func(update, context)
+            now = time.monotonic()
+            last = USER_LAST_CALL.get(user.id, 0.0)
+            if last and (now - last) < seconds:
+                remaining = seconds - (now - last)
+                msg = (
+                    f"⏳ Please wait {math.ceil(remaining)}s before "
+                    "repeating this action."
+                )
+                query = update.callback_query
+                if query is not None:
+                    with contextlib.suppress(Exception):
+                        await query.answer(text=msg, show_alert=True)
+                else:
+                    message = update.effective_message
+                    if message is not None:
+                        with contextlib.suppress(Exception):
+                            await message.reply_text(msg)
+                return None
+            USER_LAST_CALL[user.id] = now
+            return await func(update, context)
+
+        return wrapper
+
+    return decorator
+
+
+async def cleanup_rate_limit_cache(ttl_seconds: int = 3600) -> None:
+    """Drop stale per-user entries hourly to keep memory usage minimal."""
+    while True:
+        await asyncio.sleep(3600)
+        now = time.monotonic()
+        stale = [uid for uid, ts in USER_LAST_CALL.items() if now - ts > ttl_seconds]
+        for uid in stale:
+            USER_LAST_CALL.pop(uid, None)
+        if stale:
+            log.info("Rate-limit cache cleanup: removed %s inactive users", len(stale))
 
 # ---------------------------------------------------------------------------
 # 13. Configuration
@@ -1984,7 +2040,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Commands</b>\n"
         "/start — main menu\n"
         "/run — run your latest project\n"
+        "/list — paginated list of your projects\n"
         "/stats — owner-only bot statistics\n"
+        "/status — owner-only live RAM/CPU status\n"
         "/cancel_input — cancel a waiting-for-input prompt\n"
         "/exit_term — leave terminal mode\n"
         "/help — this help"
@@ -1992,18 +2050,94 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
+# ---- paginated project list -------------------------------------------------
+def _render_list_page(projects: list[dict], page: int) -> tuple[str, InlineKeyboardMarkup]:
+    total_pages = max(1, math.ceil(len(projects) / LIST_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * LIST_PAGE_SIZE
+    items = projects[start : start + LIST_PAGE_SIZE]
+
+    lines = [
+        f"📦 <b>Your projects</b> — page {page + 1}/{total_pages}",
+        "",
+    ]
+    for p in items:
+        name = p.get("name", p.get("id", "?"))
+        runtime = p.get("runtime", "?")
+        lines.append(f"📄 <code>{esc(name)}</code> — <i>{esc(runtime)}</i>")
+
+    prev_btn = btn("⬅️ Prev", f"list:{page - 1}") if page > 0 else btn("⛔", "noop")
+    next_btn = (
+        btn("Next ➡️", f"list:{page + 1}") if page < total_pages - 1 else btn("⛔", "noop")
+    )
+    keys = [
+        row(prev_btn, btn(f"Page {page + 1} / {total_pages}", "noop"), next_btn),
+        row(btn("❌ Close List", "list_close")),
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(keys)
+
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Paginated inline menu of the user's uploaded projects (/list)."""
+    user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None:
+        return
+    record = await _require_approved(update, context)
+    if record is None:
+        return
+    store = _store(context)
+    projects = store.projects_for(user.id)
+    if not projects:
+        await message.reply_text("📦 You have no projects yet. Upload a script to get started.")
+        return
+    text, markup = _render_list_page(projects, 0)
+    await message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+
+
+@rate_limit(3)
+async def _cb_list_paginate(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, payload: str
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+    with contextlib.suppress(Exception):
+        await query.answer()
+    store = _store(context)
+    projects = store.projects_for(user.id)
+    if not projects:
+        await _safe_edit(context, query, "📦 You have no projects yet.", None)
+        return
+    page = _safe_int(payload) or 0
+    text, markup = _render_list_page(projects, page)
+    await _safe_edit(context, query, text, markup)
+
+
+async def _cb_list_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    await _safe_edit(context, query, "❌ List closed.", None)
+
+
 # ---- callback routing ------------------------------------------------------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
         return
-    await query.answer()
     user = query.from_user
     if user is None:
         return
     data = query.data or ""
     verb, sep, payload = data.partition(":")
 
+    if verb == "list":
+        await _cb_list_paginate(update, context, payload)
+        return
+
+    await query.answer()
     cfg = _cfg(context)
     store = _store(context)
 
@@ -2067,6 +2201,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if verb == "health":
         await _cb_health(update, context)
+        return
+    if verb == "list_close":
+        await _cb_list_close(update, context)
+        return
+    if verb == "noop":
         return
 
     await _safe_edit(context, query, "Unknown action.", None)
@@ -2945,6 +3084,7 @@ def _build_app(
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("exit_term", cmd_exit_term))
@@ -3035,6 +3175,8 @@ async def run() -> None:
     monitor_task = asyncio.create_task(_memory_monitor_loop(300))
     log_memory_usage()
     log.info("Memory monitor active (interval=300s)")
+    cleanup_task = asyncio.create_task(cleanup_rate_limit_cache())
+    log.info("Rate-limit cache cleanup active (hourly)")
 
     retry_delay = cfg.watchdog_retry_seconds
     attempt = 0
@@ -3060,6 +3202,9 @@ async def run() -> None:
         monitor_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await monitor_task
+        cleanup_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cleanup_task
 
     log.info("Cleaning up")
     await manager.shutdown()
