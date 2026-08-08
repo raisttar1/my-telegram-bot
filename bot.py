@@ -36,6 +36,7 @@ import html
 import json
 import logging
 import os
+import psutil
 import re
 import resource
 import shlex
@@ -97,6 +98,8 @@ ALLOWED_EXTENSIONS = {".py", ".js", ".zip"}
 ZIP_ENTRY_LIMIT_MSG = "Archive contains too many files."
 
 log = logging.getLogger(APP_NAME)
+
+START_TIME = time.monotonic()
 
 # ---------------------------------------------------------------------------
 # 13. Configuration
@@ -1708,12 +1711,13 @@ def row(*buttons: InlineKeyboardButton) -> list[InlineKeyboardButton]:
 
 def main_menu_markup(is_owner: bool) -> InlineKeyboardMarkup:
     keys = [
-        row(btn("💻 Terminal", "ui:term"), btn("📁 Upload File", "ui:upload")),
-        row(btn("🛑 Stop Script", "ui:stop"), btn("📂 My Scripts", "my:0")),
-        row(btn("📝 View Logs", "plist:0"), btn("🖥 Running", "running:0")),
+        row(btn("⌨️ Terminal", "ui:term"), btn("📤 Upload Script", "ui:upload")),
+        row(btn("⏹️ Stop Tasks", "ui:stop"), btn("📂 Workspace", "my:0")),
+        row(btn("📜 View Logs", "plist:0"), btn("🖥 Running", "running:0")),
+        row(btn("⚡ Server Health", "health")),
     ]
     if is_owner:
-        keys.append(row(btn("👑 Admin Panel", "admin:home")))
+        keys.append(row(btn("👑 Admin Dashboard", "admin:home")))
     return InlineKeyboardMarkup(keys)
 
 
@@ -1815,7 +1819,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if user.id == cfg.owner_id:
         await _owner_menu(
             update, context,
-            f"Welcome back, <b>{esc(user.full_name)}</b>! You are the owner.",
+            f"✨ Welcome back, <b>{esc(user.full_name)}</b>! You are the owner.\n"
+            "🟢 ONLINE 24/7",
         )
         return
 
@@ -1843,7 +1848,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if record.get("status") == USER_APPROVED:
         await _owner_menu(
             update, context,
-            f"Welcome, <b>{esc(user.full_name)}</b>!\n"
+            f"✨ Welcome, <b>{esc(user.full_name)}</b>!\n"
+            "🟢 ONLINE 24/7\n"
             "Upload a <code>.py</code> / <code>.js</code> / <code>.zip</code> "
             "project, then run it.",
         )
@@ -1981,6 +1987,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if verb == "running":
         await _cb_running(update, context, payload)
         return
+    if verb == "health":
+        await _cb_health(update, context)
+        return
 
     await _safe_edit(context, query, "Unknown action.", None)
 
@@ -2040,14 +2049,14 @@ async def _cb_ui(update: Update, context: ContextTypes.DEFAULT_TYPE, payload: st
         context.user_data["term_mode"] = True
         await _safe_edit(
             context, query,
-            "Terminal mode is ON.\n\nAllowed: <code>pwd ls cd cat head tail mkdir "
+            "⌨️ <b>Terminal mode is ON</b>.\n\nAllowed: <code>pwd ls cd cat head tail mkdir "
             "cp mv rm</code>\nNo shell operators/pipes.\n\nSend a command, or /exit_term.",
             _back_home_markup(user.id == _cfg(context).owner_id),
         )
     elif payload == "upload":
         await _safe_edit(
             context, query,
-            "Send me a <code>.py</code>, <code>.js</code> or <code>.zip</code> file. "
+            "📤 Send me a <code>.py</code>, <code>.js</code> or <code>.zip</code> file. "
             "Max <code>" + str(_cfg(context).max_upload_mb) + " MB</code>.",
             _back_home_markup(user.id == _cfg(context).owner_id),
         )
@@ -2097,7 +2106,7 @@ async def _cb_my_scripts(update: Update, context: ContextTypes.DEFAULT_TYPE, pay
     if not projects:
         await _safe_edit(
             context, query,
-            "You have no scripts yet. Upload a <code>.py</code>/<code>.js</code>/<code>.zip</code>.",
+            "📂 You have no scripts yet. Upload a <code>.py</code>/<code>.js</code>/<code>.zip</code>.",
             _back_home_markup(user.id == _cfg(context).owner_id),
         )
         return
@@ -2108,7 +2117,7 @@ async def _cb_my_scripts(update: Update, context: ContextTypes.DEFAULT_TYPE, pay
     keys.append([btn("⬅ Back", "menu")])
     await _safe_edit(
         context, query,
-        "Your scripts — tap one to run it.",
+        "📂 <b>Workspace</b> — your scripts; tap one to run it.",
         InlineKeyboardMarkup(keys),
     )
 
@@ -2147,7 +2156,7 @@ async def _cb_process_list(
     if not procs:
         await _safe_edit(
             context, query,
-            "No processes yet.",
+            "📜 No processes yet.",
             _back_home_markup(user.id == cfg.owner_id),
         )
         return
@@ -2159,11 +2168,11 @@ async def _cb_process_list(
         )
         keys.append(row(btn(label, f"plog:{p['id']}")))
     if header == "running":
-        keys.append([btn("🛑 Stop running", f"running:{user.id}")])
+        keys.append([btn("⏹️ Stop running", f"running:{user.id}")])
     keys.append([btn("⬅ Back", "menu")])
     await _safe_edit(
         context, query,
-        f"<b>Your processes</b>\n{header or ''}",
+        f"📜 <b>Your processes</b>\n{header or ''}",
         InlineKeyboardMarkup(keys),
     )
 
@@ -2203,7 +2212,7 @@ async def _cb_view_log(update: Update, context: ContextTypes.DEFAULT_TYPE, paylo
     lines.append(f"<b>Output</b>:\n<pre>{body}</pre>")
     keys = []
     if proc_rec.get("status") in RUNNING_STATUSES:
-        keys.append(row(btn("🛑 Stop", f"stop:{payload}")))
+        keys.append(row(btn("⏹️ Stop", f"stop:{payload}")))
     keys.append([btn("⬅ Back", "plist:0")])
     await _safe_edit(context, query, "\n".join(lines), InlineKeyboardMarkup(keys))
 
@@ -2238,9 +2247,31 @@ async def _cb_running(update: Update, context: ContextTypes.DEFAULT_TYPE, payloa
         return
     keys = []
     for p in procs:
-        keys.append(row(btn(f"🛑 {p.project_name} ({p.id})", f"stop:{p.id}")))
+        keys.append(row(btn(f"⏹️ {p.project_name} ({p.id})", f"stop:{p.id}")))
     keys.append([btn("⬅ Back", "menu")])
-    await _safe_edit(context, query, "Running processes:", InlineKeyboardMarkup(keys))
+    await _safe_edit(context, query, "🖥 <b>Running processes</b>:", InlineKeyboardMarkup(keys))
+
+
+async def _cb_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+    cfg = _cfg(context)
+    manager = _manager(context)
+    health = _system_health(manager)
+    mem = psutil.virtual_memory()
+    uptime = int(health["uptime_seconds"])
+    lines = [
+        "⚡ <b>Server Health</b>",
+        f"🟢 Status: <b>{health['status'].upper()}</b> — ONLINE 24/7",
+        f"⏱ Uptime: {uptime // 3600}h {uptime % 3600 // 60}m",
+        f"📦 Active processes: {health['active_processes']}",
+        f"🧠 CPU: {health['cpu_percent']:.1f}%",
+        f"💾 RAM: {health['ram_percent']:.1f}% "
+        f"({human_size(mem.used)} / {human_size(mem.total)})",
+    ]
+    await _safe_edit(context, query, "\n".join(lines), _back_home_markup(user.id == cfg.owner_id))
 
 
 # ---- admin callbacks -------------------------------------------------------
@@ -2297,7 +2328,7 @@ async def _cb_admin(
                 row(btn("⬅ Back", "menu")),
             ]
             await _safe_edit(
-                context, query, "👑 Admin Panel", InlineKeyboardMarkup(keys)
+                context, query, "👑 Admin Dashboard", InlineKeyboardMarkup(keys)
             )
             return
         await _safe_edit(context, query, "Unknown admin action.", None)
@@ -2610,7 +2641,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif has_pkg:
         dep_note = "\nDependencies from <code>package.json</code> will be installed automatically."
 
-    keys = [[btn("▶ Run", f"run:{project_id}"), btn("📂 My Scripts", "my:0")]]
+    keys = [[btn("▶ Run", f"run:{project_id}"), btn("📂 Workspace", "my:0")]]
     await message.reply_text(
         f"Uploaded <code>{esc(safe_name)}</code>\n"
         f"Entrypoint: <code>{esc(entrypoint)}</code> ({runtime}){dep_note}",
@@ -2721,20 +2752,35 @@ async def _safe_edit(
 # ---------------------------------------------------------------------------
 # 11. Flask health server
 # ---------------------------------------------------------------------------
-def create_flask_app() -> Flask:
+def _system_health(manager: Optional[ProcessManager] = None) -> dict:
+    active = 0
+    if manager is not None:
+        active = sum(1 for p in manager.active.values() if not p.finished)
+    mem = psutil.virtual_memory()
+    return {
+        "status": "ok",
+        "service": "telegram-bot",
+        "uptime_seconds": int(time.monotonic() - START_TIME),
+        "active_processes": active,
+        "cpu_percent": round(psutil.cpu_percent(interval=0.1), 1),
+        "ram_percent": round(mem.percent, 1),
+    }
+
+
+def create_flask_app(manager: Optional[ProcessManager] = None) -> Flask:
     app = Flask(__name__)
 
     @app.get("/")
     @app.get("/api/")
     @app.get("/api/healthz")
     def healthz():
-        return jsonify({"status": "ok", "service": "telegram-bot"})
+        return jsonify(_system_health(manager))
 
     return app
 
 
-def start_health_server(cfg: Config) -> None:
-    app = create_flask_app()
+def start_health_server(cfg: Config, manager: Optional[ProcessManager] = None) -> None:
+    app = create_flask_app(manager)
 
     def _serve() -> None:
         try:
@@ -2810,7 +2856,7 @@ async def run() -> None:
     store._cfg_max_stored = cfg.max_stored_processes_per_user
     manager = ProcessManager(cfg, store)
 
-    start_health_server(cfg)
+    start_health_server(cfg, manager)
 
     app = _build_app(cfg, store, manager)
 

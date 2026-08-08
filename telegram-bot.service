@@ -1,5 +1,5 @@
 [Unit]
-Description=Telegram Script Hosting Bot (24/7)
+Description=Emoji-Enhanced 24/7 Telegram Control Bot
 After=network.target docker.service
 Wants=docker.service
 
