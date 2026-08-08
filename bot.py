@@ -32,11 +32,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import html
 import json
 import logging
 import os
-import psutil
 import re
 import resource
 import shlex
@@ -49,9 +49,17 @@ import threading
 import time
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+
+try:  # pragma: no cover - import guard
+    import psutil  # type: ignore
+    PSUTIL_AVAILABLE = True
+except Exception:  # pragma: no cover
+    psutil = None  # type: ignore
+    PSUTIL_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Dependencies (optional imports handled lazily so the bot can start even if
@@ -68,9 +76,6 @@ try:  # pragma: no cover - import guard
     load_dotenv()
 except Exception:  # pragma: no cover
     pass
-
-from flask import Flask, jsonify
-from waitress import serve
 
 from telegram import (
     InlineKeyboardButton,
@@ -103,6 +108,56 @@ ZIP_ENTRY_LIMIT_MSG = "Archive contains too many files."
 log = logging.getLogger(APP_NAME)
 
 START_TIME = time.monotonic()
+
+
+def _process_rss_mb() -> float:
+    if psutil is None:
+        return 0.0
+    try:
+        return psutil.Process().memory_info().rss / (1024 * 1024)
+    except Exception:  # pragma: no cover - psutil platform quirks
+        return 0.0
+
+
+def _mem_stats() -> dict:
+    if psutil is None:
+        return {
+            "rss_mb": 0.0,
+            "used_gb": 0.0,
+            "total_gb": 0.0,
+            "percent": 0.0,
+            "cpu_percent": 0.0,
+        }
+    try:
+        vm = psutil.virtual_memory()
+        cpu = psutil.cpu_percent(interval=0.1)
+    except Exception:  # pragma: no cover - psutil platform quirks
+        vm = None
+        cpu = 0.0
+    return {
+        "rss_mb": _process_rss_mb(),
+        "used_gb": round(vm.used / (1024**3), 2) if vm else 0.0,
+        "total_gb": round(vm.total / (1024**3), 2) if vm else 0.0,
+        "percent": round(vm.percent, 1) if vm else 0.0,
+        "cpu_percent": round(cpu, 1),
+    }
+
+
+def log_memory_usage() -> None:
+    m = _mem_stats()
+    log.info(
+        "memory: bot_rss=%.1fMB sys_used=%.2fGB/%.2fGB (%.1f%%)",
+        m["rss_mb"],
+        m["used_gb"],
+        m["total_gb"],
+        m["percent"],
+    )
+
+
+async def _memory_monitor_loop(interval_seconds: int = 300) -> None:
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await asyncio.to_thread(log_memory_usage)
 
 # ---------------------------------------------------------------------------
 # 13. Configuration
@@ -1586,6 +1641,7 @@ class ProcessManager:
 
         self.active.pop(proc.id, None)
         self._persist(proc)
+        gc.collect()
         await self._maybe_render_live(proc, force=True)
         log.info(
             "Process %s finalized: status=%s exit=%s note=%s",
@@ -2282,7 +2338,6 @@ async def _cb_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cfg = _cfg(context)
     manager = _manager(context)
     health = _system_health(manager)
-    mem = psutil.virtual_memory()
     uptime = int(health["uptime_seconds"])
     lines = [
         "⚡ <b>Server Health</b>",
@@ -2291,7 +2346,8 @@ async def _cb_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"📦 Active processes: {health['active_processes']}",
         f"🧠 CPU: {health['cpu_percent']:.1f}%",
         f"💾 RAM: {health['ram_percent']:.1f}% "
-        f"({human_size(mem.used)} / {human_size(mem.total)})",
+        f"({health['sys_used_gb']:.2f} GB / {health['sys_total_gb']:.2f} GB)",
+        f"🤖 Bot process: {health['bot_rss_mb']:.1f} MB RSS",
     ]
     await _safe_edit(context, query, "\n".join(lines), _back_home_markup(user.id == cfg.owner_id))
 
@@ -2623,47 +2679,50 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     safe_name = sanitize_filename(filename)
     dest = project_dir / safe_name
 
-    try:
-        tmp = project_dir / f".tmp_{project_id}"
-        file = await context.bot.get_file(doc.file_id)
-        await file.download_to_drive(tmp)
-        if tmp.stat().st_size > cfg.max_upload_bytes:
-            raise ValueError(
-                f"File too large: {human_size(tmp.stat().st_size)} (max {cfg.max_upload_mb} MB)."
-            )
-
-        if ext == ".zip":
-            if tmp.stat().st_size > cfg.max_archive_bytes:
+    sem: asyncio.Semaphore = context.bot_data["upload_sem"]
+    async with sem:
+        try:
+            tmp = project_dir / f".tmp_{project_id}"
+            file = await context.bot.get_file(doc.file_id)
+            await file.download_to_drive(tmp)
+            if tmp.stat().st_size > cfg.max_upload_bytes:
                 raise ValueError(
-                    f"Archive too large: {human_size(tmp.stat().st_size)} (max {cfg.max_archive_mb} MB)."
+                    f"File too large: {human_size(tmp.stat().st_size)} (max {cfg.max_upload_mb} MB)."
                 )
-            entrypoint, runtime, files = await asyncio.to_thread(
-                _prepare_zip_project, tmp, project_dir, cfg
-            )
-            log.info("Extracted %s files for project %s (user %s)", len(files), project_id, user.id)
-        else:
-            shutil.move(str(tmp), str(dest))
-            entrypoint, runtime = detect_entrypoint(project_dir)
-            files = scan_project_files(project_dir)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Upload rejected for user %s: %s", user.id, exc)
-        shutil.rmtree(project_dir, ignore_errors=True)
-        await message.reply_text(f"Upload rejected: {esc(exc)}", parse_mode=ParseMode.HTML)
-        return
 
-    has_req = (project_dir / "requirements.txt").exists()
-    has_pkg = (project_dir / "package.json").exists()
-    project = {
-        "id": project_id,
-        "name": safe_name if ext != ".zip" else f"{safe_name} ({project_id[:6]})",
-        "entrypoint": entrypoint,
-        "runtime": runtime,
-        "uploaded_at": time.time(),
-        "files": files,
-        "has_requirements": has_req,
-        "has_package_json": has_pkg,
-    }
-    store.add_project(user.id, project)
+            if ext == ".zip":
+                if tmp.stat().st_size > cfg.max_archive_bytes:
+                    raise ValueError(
+                        f"Archive too large: {human_size(tmp.stat().st_size)} (max {cfg.max_archive_mb} MB)."
+                    )
+                entrypoint, runtime, files = await asyncio.to_thread(
+                    _prepare_zip_project, tmp, project_dir, cfg
+                )
+                log.info("Extracted %s files for project %s (user %s)", len(files), project_id, user.id)
+            else:
+                shutil.move(str(tmp), str(dest))
+                entrypoint, runtime = detect_entrypoint(project_dir)
+                files = scan_project_files(project_dir)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Upload rejected for user %s: %s", user.id, exc)
+            shutil.rmtree(project_dir, ignore_errors=True)
+            await message.reply_text(f"Upload rejected: {esc(exc)}", parse_mode=ParseMode.HTML)
+            return
+
+        has_req = (project_dir / "requirements.txt").exists()
+        has_pkg = (project_dir / "package.json").exists()
+        project = {
+            "id": project_id,
+            "name": safe_name if ext != ".zip" else f"{safe_name} ({project_id[:6]})",
+            "entrypoint": entrypoint,
+            "runtime": runtime,
+            "uploaded_at": time.time(),
+            "files": files,
+            "has_requirements": has_req,
+            "has_package_json": has_pkg,
+        }
+        store.add_project(user.id, project)
+        gc.collect()
 
     dep_note = ""
     if has_req:
@@ -2740,6 +2799,29 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only /status: live system RAM, bot process RAM, and uptime."""
+    user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None:
+        return
+    cfg = _cfg(context)
+    if user.id != cfg.owner_id:
+        await message.reply_text("This command is only available to the bot owner.")
+        return
+    m = _mem_stats()
+    uptime = int(time.monotonic() - START_TIME)
+    lines = [
+        "📊 <b>Status</b>",
+        f"⏱ Uptime: {uptime // 3600}h {uptime % 3600 // 60}m {uptime % 60}s",
+        f"🤖 Bot process RSS: <b>{m['rss_mb']:.1f} MB</b>",
+        f"💾 System RAM: {m['used_gb']:.2f} GB / {m['total_gb']:.2f} GB "
+        f"({m['percent']:.1f}% used)",
+        f"🧠 CPU: {m['cpu_percent']:.1f}%",
+    ]
+    await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 async def cmd_exit_term(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("term_mode", None)
     await update.effective_message.reply_text("Terminal mode OFF.")
@@ -2786,18 +2868,23 @@ def _system_health(manager: Optional[ProcessManager] = None) -> dict:
     active = 0
     if manager is not None:
         active = sum(1 for p in manager.active.values() if not p.finished)
-    mem = psutil.virtual_memory()
+    mem = _mem_stats()
     return {
         "status": "ok",
         "service": "telegram-bot",
         "uptime_seconds": int(time.monotonic() - START_TIME),
         "active_processes": active,
-        "cpu_percent": round(psutil.cpu_percent(interval=0.1), 1),
-        "ram_percent": round(mem.percent, 1),
+        "cpu_percent": mem["cpu_percent"],
+        "ram_percent": mem["percent"],
+        "bot_rss_mb": round(mem["rss_mb"], 1),
+        "sys_used_gb": mem["used_gb"],
+        "sys_total_gb": mem["total_gb"],
     }
 
 
-def create_flask_app(manager: Optional[ProcessManager] = None) -> Flask:
+def create_flask_app(manager: Optional[ProcessManager] = None) -> "Flask":
+    from flask import Flask, jsonify
+
     app = Flask(__name__)
 
     @app.get("/")
@@ -2810,6 +2897,8 @@ def create_flask_app(manager: Optional[ProcessManager] = None) -> Flask:
 
 
 def start_health_server(cfg: Config, manager: Optional[ProcessManager] = None) -> None:
+    from waitress import serve
+
     app = create_flask_app(manager)
 
     def _serve() -> None:
@@ -2826,7 +2915,12 @@ def start_health_server(cfg: Config, manager: Optional[ProcessManager] = None) -
 # ---------------------------------------------------------------------------
 # 12. Main
 # ---------------------------------------------------------------------------
-def _build_app(cfg: Config, store: DataStore, manager: ProcessManager) -> Application:
+def _build_app(
+    cfg: Config,
+    store: DataStore,
+    manager: ProcessManager,
+    upload_sem: Optional[asyncio.Semaphore] = None,
+) -> Application:
     request = HTTPXRequest(
         connect_timeout=cfg.http_connect_timeout,
         read_timeout=cfg.http_read_timeout,
@@ -2845,12 +2939,14 @@ def _build_app(cfg: Config, store: DataStore, manager: ProcessManager) -> Applic
     app.bot_data["store"] = store
     app.bot_data["manager"] = manager
     app.bot_data["term_engines"] = {}
+    app.bot_data["upload_sem"] = upload_sem or asyncio.Semaphore(4)
     manager.bot = app.bot
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("exit_term", cmd_exit_term))
     app.add_handler(CommandHandler("cancel_input", cmd_cancel_input))
     app.add_handler(CallbackQueryHandler(on_callback))
@@ -2931,25 +3027,39 @@ async def run() -> None:
 
     start_health_server(cfg, manager)
 
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(
+        ThreadPoolExecutor(max_workers=4, thread_name_prefix="worker")
+    )
+
+    monitor_task = asyncio.create_task(_memory_monitor_loop(300))
+    log_memory_usage()
+    log.info("Memory monitor active (interval=300s)")
+
     retry_delay = cfg.watchdog_retry_seconds
     attempt = 0
-    while True:
-        attempt += 1
-        try:
-            await _run_once(cfg, store, manager)
-            log.info("Bot exiting after graceful shutdown")
-            break
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001
-            log.exception(
-                "Bot crashed (attempt %s); reconnecting in %ss",
-                attempt,
-                retry_delay,
-            )
-            await asyncio.sleep(retry_delay)
+    try:
+        while True:
+            attempt += 1
+            try:
+                await _run_once(cfg, store, manager)
+                log.info("Bot exiting after graceful shutdown")
+                break
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "Bot crashed (attempt %s); reconnecting in %ss",
+                    attempt,
+                    retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+    finally:
+        monitor_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await monitor_task
 
     log.info("Cleaning up")
     await manager.shutdown()
