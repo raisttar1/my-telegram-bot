@@ -224,3 +224,4 @@ venvs/
 logs/
 *.tmp
 *.corrupt.json
+workspaces/
